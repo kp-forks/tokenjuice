@@ -10,6 +10,23 @@ import type { ArtifactMetadataRef, StoredArtifact, StoredArtifactInput, StoredAr
 
 const ARTIFACT_ID_PATTERN = /^tj_[0-9a-f-]{12}$/iu;
 export const ARTIFACT_DIR_ENV = "TOKENJUICE_ARTIFACT_DIR";
+const OPTIONAL_METADATA_STORAGE_ERROR_CODES = new Set([
+  "EACCES",
+  "EDQUOT",
+  "EEXIST",
+  "EFBIG",
+  "EIO",
+  "EISDIR",
+  "ELOOP",
+  "EMFILE",
+  "ENAMETOOLONG",
+  "ENFILE",
+  "ENOENT",
+  "ENOSPC",
+  "ENOTDIR",
+  "EPERM",
+  "EROFS",
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -151,6 +168,22 @@ export async function storeArtifactMetadata(input: StoredArtifactInput, storeDir
     metadataPath,
     metadata,
   };
+}
+
+export async function tryStoreArtifactMetadata(
+  input: StoredArtifactInput,
+  storeDir?: string,
+): Promise<ArtifactMetadataRef | undefined> {
+  try {
+    return await storeArtifactMetadata(input, storeDir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (typeof code !== "string" || !OPTIONAL_METADATA_STORAGE_ERROR_CODES.has(code)) {
+      throw error;
+    }
+
+    return undefined;
+  }
 }
 
 export async function getArtifact(id: string, storeDir?: string): Promise<StoredArtifact | null> {

@@ -82,6 +82,22 @@ copilot-cli and vscode-copilot both read every `*.json` under `~/.copilot/hooks/
 
 if you add a new host to aggregate doctor logic, existing aggregate tests may start failing unless they set that host's env home to temp storage.
 
+### shared Codex hooks renderer
+
+when `codex-hooks` is executable on `PATH`, the Codex installer registers the
+top-level `{"hooks": ...}` fragment as `tokenjuice.post-tool-use` and leaves the
+effective `hooks.json` write to that renderer. uninstall unregisters the same
+integration id. install and uninstall both provide the detected legacy
+Tokenjuice group as an owned-source manifest so the renderer can adopt or
+remove pre-fragment standalone state. without the renderer, Tokenjuice can update a regular
+standalone hooks file with a source-content check; it refuses to replace an
+externally owned symlink.
+
+standalone install and uninstall remove only Tokenjuice commands from a matcher
+group and preserve nested custom commands. the shared renderer currently owns
+whole groups, so Tokenjuice rejects a mixed Tokenjuice/custom group before
+invoking it; split those commands into distinct matcher groups and retry.
+
 ## regression gates before merge
 
 minimum gate for a new host adapter:

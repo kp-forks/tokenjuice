@@ -1,12 +1,12 @@
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { countTextChars } from "../../src/core/text.js";
-import { doctorCodexHook, installCodexHook, listArtifactMetadata, runCodexPostToolUseHook, uninstallCodexHook } from "../../src/index.js";
+import { doctorCodexHook, installCodexHook, listArtifactMetadata, listArtifacts, runCodexPostToolUseHook, uninstallCodexHook } from "../../src/index.js";
 
 const tempDirs: string[] = [];
 const PACKAGE_VERSION = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version as string;
@@ -14,17 +14,30 @@ const originalHome = process.env.HOME;
 const originalPath = process.env.PATH;
 const originalNoOmission = process.env.TOKENJUICE_NO_OMISSION;
 const originalCodexMaxInlineChars = process.env.TOKENJUICE_CODEX_MAX_INLINE_CHARS;
+const originalStatsEnabled = process.env.TOKENJUICE_STATS;
+const originalCodexStore = process.env.TOKENJUICE_CODEX_STORE;
+const originalArtifactDir = process.env.TOKENJUICE_ARTIFACT_DIR;
+const originalComSpec = process.env.ComSpec;
+const originalPlatform = process.platform;
 
 beforeEach(() => {
   // These assertions describe the default reducer policy, not a caller's opt-out environment.
   delete process.env.TOKENJUICE_NO_OMISSION;
   delete process.env.TOKENJUICE_CODEX_MAX_INLINE_CHARS;
+  delete process.env.TOKENJUICE_STATS;
+  delete process.env.TOKENJUICE_CODEX_STORE;
 });
 
 afterEach(async () => {
   delete process.env.CODEX_HOME;
   process.env.HOME = originalHome;
   process.env.PATH = originalPath;
+  Object.defineProperty(process, "platform", { value: originalPlatform });
+  if (originalComSpec === undefined) {
+    delete process.env.ComSpec;
+  } else {
+    process.env.ComSpec = originalComSpec;
+  }
   if (originalNoOmission === undefined) {
     delete process.env.TOKENJUICE_NO_OMISSION;
   } else {
@@ -35,6 +48,21 @@ afterEach(async () => {
   } else {
     process.env.TOKENJUICE_CODEX_MAX_INLINE_CHARS = originalCodexMaxInlineChars;
   }
+  if (originalStatsEnabled === undefined) {
+    delete process.env.TOKENJUICE_STATS;
+  } else {
+    process.env.TOKENJUICE_STATS = originalStatsEnabled;
+  }
+  if (originalCodexStore === undefined) {
+    delete process.env.TOKENJUICE_CODEX_STORE;
+  } else {
+    process.env.TOKENJUICE_CODEX_STORE = originalCodexStore;
+  }
+  if (originalArtifactDir === undefined) {
+    delete process.env.TOKENJUICE_ARTIFACT_DIR;
+  } else {
+    process.env.TOKENJUICE_ARTIFACT_DIR = originalArtifactDir;
+  }
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -42,6 +70,20 @@ async function createTempDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "tokenjuice-codex-test-"));
   tempDirs.push(dir);
   return dir;
+}
+
+async function readHookHistory(home: string): Promise<Array<Record<string, unknown>>> {
+  const directory = join(home, "tokenjuice-hook.history-v1");
+  const files = (await readdir(directory)).filter((name) => name.endsWith(".jsonl"));
+  return (
+    await Promise.all(files.map(async (name) =>
+      (await readFile(join(directory, name), "utf8"))
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+    ))
+  ).flat();
 }
 
 async function captureStdout(run: () => Promise<number>): Promise<{ code: number; output: string }> {
@@ -118,6 +160,195 @@ function parseCodexObservation(additionalContext: string | undefined): {
 }
 
 describe("installCodexHook", () => {
+  it("registers through the shared codex-hooks renderer when available", async () => {
+    const home = await createTempDir();
+    const hooksPath = join(home, "hooks.json");
+    const binDir = join(home, "bin");
+    const launcherPath = join(binDir, "tokenjuice");
+    const rendererPath = join(binDir, "codex-hooks");
+    const rendererArgsPath = join(home, "renderer-args.json");
+
+    process.env.PATH = binDir;
+    await mkdir(binDir, { recursive: true });
+    await writeFile(launcherPath, "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+    await writeFile(
+      rendererPath,
+      `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const value = (name) => args[args.indexOf(name) + 1];
+const target = value("--target");
+let config = fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, "utf8")) : { hooks: {} };
+if (args[0] === "register") {
+  const fragment = JSON.parse(fs.readFileSync(value("--fragment"), "utf8"));
+  config.hooks.PostToolUse = [...(config.hooks.PostToolUse || []), ...fragment.hooks.PostToolUse];
+} else {
+  config.hooks.PostToolUse = (config.hooks.PostToolUse || []).filter((group) =>
+    !group.hooks.some((hook) => hook.statusMessage === "compacting bash output with tokenjuice")
+  );
+}
+fs.writeFileSync(target, JSON.stringify(config, null, 2) + "\\n");
+fs.writeFileSync(${JSON.stringify(rendererArgsPath)}, JSON.stringify(args));
+`,
+      { encoding: "utf8", mode: 0o755 },
+    );
+
+    const installed = await installCodexHook(hooksPath);
+    expect(installed.writer).toBe("codex-hooks");
+    expect(installed.fragmentId).toBe("tokenjuice.post-tool-use");
+    expect(JSON.parse(await readFile(rendererArgsPath, "utf8"))).toEqual(expect.arrayContaining([
+      "register",
+      "--integration-id",
+      "tokenjuice.post-tool-use",
+      "--fragment",
+      expect.stringContaining(".tokenjuice-hooks-fragment-"),
+      "--target",
+      hooksPath,
+    ]));
+
+    const uninstalled = await uninstallCodexHook(hooksPath);
+    expect(uninstalled.writer).toBe("codex-hooks");
+    expect(uninstalled.removed).toBe(1);
+    expect(JSON.parse(await readFile(rendererArgsPath, "utf8"))).toEqual(expect.arrayContaining([
+      "unregister",
+      "--integration-id",
+      "tokenjuice.post-tool-use",
+      "--target",
+      hooksPath,
+      "--owned-source",
+      expect.stringContaining(".tokenjuice-hooks-owned-"),
+    ]));
+  });
+
+  it("launches a Windows batch renderer through ComSpec", async () => {
+    const home = await createTempDir();
+    const hooksPath = join(home, "hooks with spaces.json");
+    const binDir = join(home, "bin with spaces");
+    const launcherPath = join(binDir, "tokenjuice.exe");
+    const rendererPath = join(binDir, "codex-hooks.cmd");
+    const commandPath = join(binDir, "cmd.exe");
+    const commandArgsPath = join(home, "cmd-args.json");
+
+    process.env.PATH = binDir;
+    process.env.ComSpec = commandPath;
+    Object.defineProperty(process, "platform", { value: "win32" });
+    await mkdir(binDir, { recursive: true });
+    await writeFile(launcherPath, "", { mode: 0o755 });
+    await writeFile(rendererPath, "@echo off\r\n", { mode: 0o755 });
+    await writeFile(
+      commandPath,
+      `#!${process.execPath}
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(commandArgsPath)}, JSON.stringify(process.argv.slice(2)));
+`,
+      { encoding: "utf8", mode: 0o755 },
+    );
+
+    const installed = await installCodexHook(hooksPath, {
+      binaryPath: launcherPath,
+      featureFlagConfigPath: join(home, "config.toml"),
+    });
+
+    expect(installed.writer).toBe("codex-hooks");
+    expect(JSON.parse(await readFile(commandArgsPath, "utf8"))).toEqual([
+      "/d",
+      "/s",
+      "/c",
+      "call",
+      rendererPath,
+      "register",
+      "--integration-id",
+      "tokenjuice.post-tool-use",
+      "--target",
+      hooksPath,
+      "--fragment",
+      expect.stringContaining(".tokenjuice-hooks-fragment-"),
+    ]);
+  });
+
+  it.each([
+    ["renderer", "&"],
+    ["renderer", "%"],
+    ["renderer", "\""],
+    ["renderer", "\n"],
+    ["hooks", "&"],
+    ["hooks", "%"],
+    ["hooks", "\""],
+    ["hooks", "\n"],
+  ] as const)("rejects unsafe Windows batch %s paths containing %j before mutation", async (location, unsafe) => {
+    const home = await createTempDir();
+    const binDir = join(home, location === "renderer" ? `bin${unsafe}unsafe` : "bin");
+    const hooksDir = join(home, location === "hooks" ? `hooks${unsafe}unsafe` : "hooks-target");
+    const hooksPath = join(hooksDir, "hooks.json");
+    const launcherPath = join(binDir, "tokenjuice.exe");
+    const rendererPath = join(binDir, "codex-hooks.cmd");
+    const commandPath = join(home, "cmd.exe");
+    const commandMarker = join(home, "cmd-called");
+
+    process.env.PATH = binDir;
+    process.env.ComSpec = commandPath;
+    Object.defineProperty(process, "platform", { value: "win32" });
+    await mkdir(binDir, { recursive: true });
+    await writeFile(launcherPath, "", { mode: 0o755 });
+    await writeFile(rendererPath, "@echo off\r\n", { mode: 0o755 });
+    await writeFile(
+      commandPath,
+      `#!${process.execPath}
+require("node:fs").writeFileSync(${JSON.stringify(commandMarker)}, "called");
+`,
+      { encoding: "utf8", mode: 0o755 },
+    );
+
+    await expect(installCodexHook(hooksPath, {
+      binaryPath: launcherPath,
+      featureFlagConfigPath: join(home, "config.toml"),
+    })).rejects.toThrow("unsafe Windows batch renderer argument");
+
+    expect(existsSync(commandMarker)).toBe(false);
+    expect(existsSync(hooksDir)).toBe(false);
+  });
+
+  it.each(["install", "uninstall"] as const)(
+    "refuses renderer-backed %s before mutating a mixed Tokenjuice/custom group",
+    async (operation) => {
+      const home = await createTempDir();
+      const hooksPath = join(home, "hooks.json");
+      const binDir = join(home, "bin");
+      const rendererMarker = join(home, "renderer-called");
+      process.env.PATH = binDir;
+      await mkdir(binDir, { recursive: true });
+      await writeFile(join(binDir, "tokenjuice"), "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+      await writeFile(
+        join(binDir, "codex-hooks"),
+        `#!/bin/sh\nprintf called > ${rendererMarker}\n`,
+        { encoding: "utf8", mode: 0o755 },
+      );
+      const original = `${JSON.stringify({
+        hooks: {
+          PostToolUse: [{
+            matcher: "^Bash$",
+            hooks: [
+              {
+                type: "command",
+                command: "tokenjuice codex-post-tool-use",
+                statusMessage: "compacting bash output with tokenjuice",
+              },
+              { type: "command", command: "custom nested hook" },
+            ],
+          }],
+        },
+      }, null, 2)}\n`;
+      await writeFile(hooksPath, original, "utf8");
+
+      const run = operation === "install"
+        ? installCodexHook(hooksPath)
+        : uninstallCodexHook(hooksPath);
+      await expect(run).rejects.toThrow("mixed Tokenjuice/custom matcher group");
+      expect(await readFile(hooksPath, "utf8")).toBe(original);
+      expect(existsSync(rendererMarker)).toBe(false);
+    },
+  );
+
   it("installs a single tokenjuice PostToolUse hook and preserves unrelated hooks", async () => {
     const home = await createTempDir();
     const hooksPath = join(home, "hooks.json");
@@ -148,7 +379,10 @@ describe("installCodexHook", () => {
           PostToolUse: [
             {
               matcher: "^Bash$",
-              hooks: [{ type: "command", command: "python3 /tmp/post_tool_use_tokenjuice.py" }],
+              hooks: [
+                { type: "command", command: "python3 /tmp/post_tool_use_tokenjuice.py" },
+                { type: "command", command: "echo nested-keep", timeout: 9 },
+              ],
             },
             {
               matcher: "^Bash$",
@@ -177,12 +411,15 @@ describe("installCodexHook", () => {
       { type: "agent" },
     ]);
     expect(parsed.hooks.SessionStart).toHaveLength(1);
-    expect(parsed.hooks.PostToolUse).toHaveLength(2);
-    expect(parsed.hooks.PostToolUse[0]?.hooks[0]?.command).toBe("echo keep-me");
-    expect(parsed.hooks.PostToolUse[1]?.matcher).toBe("^Bash$");
-    expect(parsed.hooks.PostToolUse[1]?.hooks[0]?.command).toContain("codex-post-tool-use");
-    expect(parsed.hooks.PostToolUse[1]?.hooks[0]?.statusMessage).toBe("compacting bash output with tokenjuice");
-    expect(parsed.hooks.PostToolUse[1]?.hooks[0]?.timeout).toBe(30);
+    expect(parsed.hooks.PostToolUse).toHaveLength(3);
+    expect(parsed.hooks.PostToolUse[0]?.hooks).toEqual([
+      { type: "command", command: "echo nested-keep", timeout: 9 },
+    ]);
+    expect(parsed.hooks.PostToolUse[1]?.hooks[0]?.command).toBe("echo keep-me");
+    expect(parsed.hooks.PostToolUse[2]?.matcher).toBe("^Bash$");
+    expect(parsed.hooks.PostToolUse[2]?.hooks[0]?.command).toContain("codex-post-tool-use");
+    expect(parsed.hooks.PostToolUse[2]?.hooks[0]?.statusMessage).toBe("compacting bash output with tokenjuice");
+    expect(parsed.hooks.PostToolUse[2]?.hooks[0]?.timeout).toBe(30);
   });
 
   it("prefers a stable tokenjuice launcher from PATH when installing the hook", async () => {
@@ -364,7 +601,10 @@ describe("installCodexHook", () => {
             },
             {
               matcher: "^Bash$",
-              hooks: [{ type: "command", command: "python3 /tmp/post_tool_use_tokenjuice.py", statusMessage: "compacting bash output with tokenjuice" }],
+              hooks: [
+                { type: "command", command: "python3 /tmp/post_tool_use_tokenjuice.py", statusMessage: "compacting bash output with tokenjuice" },
+                { type: "command", command: "echo nested-keep", timeout: 9 },
+              ],
             },
           ],
         },
@@ -381,8 +621,11 @@ describe("installCodexHook", () => {
     expect(result.backupPath).toBe(`${hooksPath}.bak`);
     expect(result.removed).toBe(1);
     expect(parsed.hooks.SessionStart).toHaveLength(1);
-    expect(parsed.hooks.PostToolUse).toHaveLength(1);
+    expect(parsed.hooks.PostToolUse).toHaveLength(2);
     expect(parsed.hooks.PostToolUse?.[0]?.hooks[0]?.command).toBe("echo keep-me");
+    expect(parsed.hooks.PostToolUse?.[1]?.hooks).toEqual([
+      { type: "command", command: "echo nested-keep", timeout: 9 },
+    ]);
   });
 });
 
@@ -1229,7 +1472,7 @@ describe("runCodexPostToolUseHook", () => {
     expect(debug.compaction?.authoritative).toBe(false);
   });
 
-  it("does not suggest a raw rerun for a formatting-only rewrite", async () => {
+  it("leaves machine-readable JSON in the original tool result only", async () => {
     const home = await createTempDir();
     process.env.CODEX_HOME = home;
 
@@ -1251,22 +1494,49 @@ describe("runCodexPostToolUseHook", () => {
     const { code, stdout, stderr } = await captureStdio(() => runCodexPostToolUseHook(payload));
     const debug = JSON.parse(await readFile(join(home, "tokenjuice-hook.last.json"), "utf8")) as {
       rewrote: boolean;
-      compaction?: {
-        authoritative?: boolean;
-        kinds?: string[];
-      };
+      skipped?: string;
+      deliveryMode?: string;
     };
-    const response = parseCodexReplacementOutput(stdout);
-    const observation = parseCodexObservation(response.hookSpecificOutput?.additionalContext);
 
     expect(code).toBe(0);
+    expect(stdout).toBe("");
     expect(stderr).toBe("");
-    expect(debug.rewrote).toBe(true);
-    expect(debug.compaction?.authoritative).not.toBe(true);
-    expect(observation.exitCode).toBeNull();
-    expect(observation.authority).toBe("non-authoritative-rewrite");
-    expect(observation.compactedOutput).toContain('"status":"ok"');
-    expect(observation).not.toHaveProperty("recoveryReference");
+    expect(debug.rewrote).toBe(false);
+    expect(debug.skipped).toBe("machine-readable-output");
+    expect(debug.deliveryMode).toBe("original-only");
+  });
+
+  it("leaves structured JSON stdout with stderr in the original tool result only", async () => {
+    const home = await createTempDir();
+    process.env.CODEX_HOME = home;
+    const payload = JSON.stringify({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: {
+        command: "custom-tool --emit-json",
+      },
+      tool_response: {
+        stdout: JSON.stringify({
+          files: Array.from({ length: 40 }, (_, index) => ({ path: `src/file-${index}.ts` })),
+        }),
+        stderr: "warning: using cached data",
+        exit_code: 0,
+      },
+    });
+
+    const { code, stdout, stderr } = await captureStdio(() => runCodexPostToolUseHook(payload));
+    const debug = JSON.parse(await readFile(join(home, "tokenjuice-hook.last.json"), "utf8")) as {
+      rewrote: boolean;
+      skipped?: string;
+      deliveryMode?: string;
+    };
+
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toBe("");
+    expect(debug.rewrote).toBe(false);
+    expect(debug.skipped).toBe("machine-readable-output");
+    expect(debug.deliveryMode).toBe("original-only");
   });
 
   it("includes a factual recovery reference for authoritative omissions", async () => {
@@ -1304,7 +1574,7 @@ describe("runCodexPostToolUseHook", () => {
     expect(observation.source).toBe("codex-post-tool-use");
     expect(observation.exitCode).toBe(0);
     expect(observation.authority).toBe("authoritative-omission");
-    expect(observation.recoveryReference).toBe("tokenjuice wrap --raw -- <command>");
+    expect(observation.recoveryReference).toBeUndefined();
     expect(response.hookSpecificOutput?.additionalContext).not.toContain("need raw?");
   });
 
@@ -1318,14 +1588,12 @@ describe("runCodexPostToolUseHook", () => {
       tool_name: "Bash",
       exit_code: 0,
       tool_input: {
-        command: "custom-tool --emit-json",
+        command: "git log --oneline",
       },
-      tool_response: JSON.stringify({
-        files: Array.from({ length: 80 }, (_, index) => ({
-          path: `src/file-${index}.ts`,
-          warning: "quoted value",
-        })),
-      }, null, 2),
+      tool_response: Array.from(
+        { length: 80 },
+        (_, index) => `${(index + 1).toString(16).padStart(7, "a")} feat: commit ${index}`,
+      ).join("\n"),
     });
 
     const { code, stdout, stderr } = await captureStdio(() => runCodexPostToolUseHook(payload));
@@ -1342,7 +1610,7 @@ describe("runCodexPostToolUseHook", () => {
     expect(countTextChars(context!)).toBeLessThanOrEqual(400);
     expect(observation.authority).toBe("authoritative-omission");
     expect(observation.compactedOutput).toContain("compacted observation truncated");
-    expect(observation.recoveryReference).toBe("tokenjuice wrap --raw -- <command>");
+    expect(observation.recoveryReference).toBeUndefined();
     expect(debug.rewrote).toBe(true);
     expect(debug.feedbackTruncated).toBe(true);
   });
@@ -1358,14 +1626,12 @@ describe("runCodexPostToolUseHook", () => {
       tool_name: "Bash",
       exit_code: 0,
       tool_input: {
-        command: "custom-tool --emit-json",
+        command: "git log --oneline",
       },
-      tool_response: JSON.stringify({
-        files: Array.from({ length: 80 }, (_, index) => ({
-          path: `src/file-${index}.ts`,
-          warning: "quoted value",
-        })),
-      }, null, 2),
+      tool_response: Array.from(
+        { length: 80 },
+        (_, index) => `${(index + 1).toString(16).padStart(7, "a")} feat: commit ${index}`,
+      ).join("\n"),
     });
 
     const { code, stdout, stderr } = await captureStdio(() => runCodexPostToolUseHook(payload));
@@ -1378,7 +1644,7 @@ describe("runCodexPostToolUseHook", () => {
     expect(stdout).toBe("");
     expect(stderr).toBe("");
     expect(debug.rewrote).toBe(false);
-    expect(debug.skipped).toBe("observation-inline-limit");
+    expect(debug.skipped).toBe("no-compaction");
   });
 
   it("keeps the original output when the installed hook explicitly enables no-omit", async () => {
@@ -1596,7 +1862,7 @@ describe("runCodexPostToolUseHook", () => {
     expect(debug.savedChars).toBeGreaterThan(0);
     expect(debug.ratio).toBeLessThan(1);
     expect(observation.authority).toBe("authoritative-omission");
-    expect(observation.recoveryReference).toBe("tokenjuice wrap --raw -- <command>");
+    expect(observation.recoveryReference).toBeUndefined();
   });
 
   it("skips auto-rewrite for file-content inspection commands", async () => {
@@ -1708,7 +1974,7 @@ describe("runCodexPostToolUseHook", () => {
     expect(debug.reducedChars).toBe(debug.rawChars);
   });
 
-  it("routes Codex exit codes into reducers", async () => {
+  it("preserves nonzero failures in the original result without lossy context", async () => {
     const home = await createTempDir();
     process.env.CODEX_HOME = home;
 
@@ -1726,12 +1992,121 @@ describe("runCodexPostToolUseHook", () => {
 
     const { code, stdout, stderr } = await captureStdio(() => runCodexPostToolUseHook(payload));
 
-    const response = parseCodexReplacementOutput(stdout);
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toBe("");
+    const debug = JSON.parse(await readFile(join(home, "tokenjuice-hook.last.json"), "utf8")) as {
+      exitCode?: number;
+      skipped?: string;
+      deliveryMode?: string;
+    };
+    expect(debug.exitCode).toBe(2);
+    expect(debug.skipped).toBe("nonzero-exit-evidence");
+    expect(debug.deliveryMode).toBe("original-only");
+  });
+
+  it("decodes JSON-string response envelopes and preserves stdout, stderr, and status", async () => {
+    const home = await createTempDir();
+    process.env.CODEX_HOME = home;
+    const payload = JSON.stringify({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "pnpm test" },
+      tool_response: JSON.stringify({
+        stdout: "build setup succeeded",
+        stderr: "FAIL expected A received B",
+        exit_code: 23,
+      }),
+    });
+
+    const { code, stdout, stderr } = await captureStdio(() => runCodexPostToolUseHook(payload));
+    const debugText = await readFile(join(home, "tokenjuice-hook.last.json"), "utf8");
+    const debug = JSON.parse(debugText) as { exitCode?: number; rawChars?: number; skipped?: string };
 
     expect(code).toBe(0);
+    expect(stdout).toBe("");
     expect(stderr).toBe("");
-    expect(response.hookSpecificOutput?.hookEventName).toBe("PostToolUse");
-    expect(response.hookSpecificOutput?.additionalContext).toContain("exit 2");
+    expect(debug.exitCode).toBe(23);
+    expect(debug.skipped).toBe("nonzero-exit-evidence");
+    expect(debug.rawChars).toBe(countTextChars("[stdout]\nbuild setup succeeded\n[stderr]\nFAIL expected A received B"));
+  });
+
+  it.each([
+    ["instruction-file-output", "cat AGENTS.md", "# rule\ncritical instruction\n"],
+    ["instruction-file-output", "type C:\\repo\\AGENTS.md", "# rule\ncritical instruction\n"],
+    ["instruction-file-output", "type \"C:\\repo\\AGENTS.md\"", "# rule\ncritical instruction\n"],
+    ["instruction-file-output", "Get-Content .\\SKILL.md", "# skill\ncritical instruction\n"],
+    [
+      "schema-output",
+      "sqlite3 -readonly example.sqlite '.schema'",
+      "CREATE TABLE t (first TEXT, middle TEXT CHECK (length(middle) > 2), last TEXT);\n",
+    ],
+    ["schema-output", "psql app -c '\\d+'", "Table \"public.accounts\"\n Column | Type | Nullable\n"],
+  ])("keeps %s out of lossy additional context", async (reason, command, toolResponse) => {
+    const home = await createTempDir();
+    process.env.CODEX_HOME = home;
+    const payload = JSON.stringify({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command },
+      tool_response: toolResponse,
+    });
+
+    const { stdout } = await captureStdio(() => runCodexPostToolUseHook(payload));
+    const debug = JSON.parse(await readFile(join(home, "tokenjuice-hook.last.json"), "utf8")) as {
+      skipped?: string;
+    };
+
+    expect(stdout).toBe("");
+    expect(debug.skipped).toBe(reason);
+  });
+
+  it("stores critical evidence unchanged when raw retention is enabled", async () => {
+    const home = await createTempDir();
+    const artifactDir = await createTempDir();
+    process.env.CODEX_HOME = home;
+    process.env.TOKENJUICE_ARTIFACT_DIR = artifactDir;
+    process.env.TOKENJUICE_CODEX_STORE = "1";
+    process.env.TOKENJUICE_STATS = "off";
+    const toolResponse = "{\"status\":\"failed\",\"detail\":\"critical evidence\"}";
+    const payload = JSON.stringify({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "custom-tool status --json" },
+      tool_response: toolResponse,
+    });
+
+    const { code, stdout } = await captureStdio(() => runCodexPostToolUseHook(payload));
+    const artifacts = await listArtifacts(artifactDir);
+    const metadata = await listArtifactMetadata(artifactDir);
+
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(artifacts).toHaveLength(1);
+    expect(metadata).toEqual([]);
+    const stored = await readFile(artifacts[0]!.path, "utf8");
+    expect(stored).toBe(toolResponse);
+  });
+
+  it("fails open when critical-evidence raw retention cannot be written", async () => {
+    const home = await createTempDir();
+    const blockedArtifactDir = join(await createTempDir(), "artifact-dir-is-a-file");
+    process.env.CODEX_HOME = home;
+    process.env.TOKENJUICE_ARTIFACT_DIR = blockedArtifactDir;
+    process.env.TOKENJUICE_CODEX_STORE = "1";
+    await writeFile(blockedArtifactDir, "not a directory", "utf8");
+    const payload = JSON.stringify({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "custom-tool status --json" },
+      tool_response: "{\"status\":\"failed\"}",
+    });
+
+    const { code, stdout, stderr } = await captureStdio(() => runCodexPostToolUseHook(payload));
+
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toBe("");
   });
 
   it("honors tokenjuice raw bypass commands without re-compacting them", async () => {
@@ -1888,7 +2263,7 @@ describe("runCodexPostToolUseHook", () => {
     expect(artifactDir).toBeTruthy();
     const command = "tokenjuice wrap --raw -- printf 'ok\\n'";
     const metadataBefore = await listArtifactMetadata();
-    const matchingBefore = metadataBefore.filter((entry) => entry.metadata.command === command);
+    const matchingBefore = metadataBefore.filter((entry) => entry.metadata.commandFamily === "tokenjuice");
 
     const payload = JSON.stringify({
       hook_event_name: "PostToolUse",
@@ -1905,7 +2280,7 @@ describe("runCodexPostToolUseHook", () => {
       skipped?: string;
     };
     const metadata = await listArtifactMetadata();
-    const matchingMetadata = metadata.filter((entry) => entry.metadata.command === command);
+    const matchingMetadata = metadata.filter((entry) => entry.metadata.commandFamily === "tokenjuice");
     const newMetadata = matchingMetadata.find((entry) => !matchingBefore.some((before) => before.id === entry.id));
 
     expect(code).toBe(0);
@@ -1913,16 +2288,38 @@ describe("runCodexPostToolUseHook", () => {
     expect(debug.rewrote).toBe(false);
     expect(debug.skipped).toBe("explicit-raw-bypass");
     expect(matchingMetadata).toHaveLength(matchingBefore.length + 1);
-    expect(newMetadata?.metadata.command).toBe(command);
+    expect(newMetadata?.metadata.command).toBeUndefined();
+    expect(newMetadata?.metadata.commandDigest).toBeUndefined();
     expect(newMetadata?.metadata.rawChars).toBeGreaterThan(0);
     expect(newMetadata?.metadata.reducedChars).toBe(newMetadata?.metadata.rawChars);
     expect(newMetadata?.metadata.ratio).toBe(1);
     expect(newMetadata?.path).toBeUndefined();
-    expect(resolve(dirname(newMetadata!.metadataPath))).toBe(resolve(artifactDir!));
+    expect(resolve(newMetadata!.metadataPath).startsWith(resolve(artifactDir!))).toBe(true);
     expect(existsSync(join(home, ".tokenjuice", "artifacts"))).toBe(false);
   });
 
-  it("writes rolling hook history entries alongside the last snapshot", async () => {
+  it("creates no telemetry when statistics are disabled", async () => {
+    const home = await createTempDir();
+    const artifactDir = await createTempDir();
+    process.env.CODEX_HOME = home;
+    process.env.TOKENJUICE_ARTIFACT_DIR = artifactDir;
+    process.env.TOKENJUICE_STATS = "off";
+    const payload = JSON.stringify({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "git status --short" },
+      tool_response: " M src/index.ts\n",
+    });
+
+    const { code } = await captureStdio(() => runCodexPostToolUseHook(payload));
+
+    expect(code).toBe(0);
+    expect(existsSync(join(home, "tokenjuice-hook.last.json"))).toBe(false);
+    expect(existsSync(join(home, "tokenjuice-hook.history-v1"))).toBe(false);
+    expect(existsSync(join(artifactDir, "metadata-v1"))).toBe(false);
+  });
+
+  it("writes bounded hook history segments alongside the last snapshot", async () => {
     const home = await createTempDir();
     process.env.CODEX_HOME = home;
 
@@ -1956,19 +2353,20 @@ describe("runCodexPostToolUseHook", () => {
       tokenjuiceVersion?: string;
       hookCommandPath?: string;
     };
-    const historyLines = (await readFile(join(home, "tokenjuice-hook.history.jsonl"), "utf8"))
-      .trim()
-      .split("\n");
-    const history = historyLines.map((line) => JSON.parse(line) as {
+    const history = await readHookHistory(home) as Array<{
       timestamp?: string;
-      command?: string;
+      commandFamily?: string;
+      commandDigest?: string;
       skipped?: string;
       rewrote?: boolean;
       tokenjuiceVersion?: string;
       hookCommandPath?: string;
       savedChars?: number;
       ratio?: number;
-    });
+      matchedReducer?: string;
+    }>;
+    const sedEntry = history.find((entry) => entry.commandFamily === "sed");
+    const gitEntry = history.find((entry) => entry.commandFamily === "git");
 
     expect(last.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(last.command).toBe("git status --short");
@@ -1976,22 +2374,20 @@ describe("runCodexPostToolUseHook", () => {
     expect(typeof last.hookCommandPath).toBe("string");
     expect(last.hookCommandPath).not.toBe("");
     expect(history).toHaveLength(2);
-    expect(history.map((entry) => entry.command)).toEqual([
-      "sed -n '1,40p' src/hosts/codex/index.ts",
-      "git status --short",
-    ]);
-    expect(history[0]?.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-    expect(history[0]?.skipped).toBe("file-content-inspection-command");
-    expect(history[0]?.tokenjuiceVersion).toBe(PACKAGE_VERSION);
-    expect(history[0]?.savedChars).toBe(0);
-    expect(history[0]?.ratio).toBe(1);
-    expect(history[0]?.matchedReducer).toBeUndefined();
-    expect(history[1]?.rewrote).toBe(false);
-    expect(history[1]?.skipped).toBe("no-compaction");
-    expect(history[1]?.savedChars).toBe(1);
+    expect(history.map((entry) => entry.commandFamily).sort()).toEqual(["git", "sed"]);
+    expect(history.every((entry) => entry.commandDigest === undefined)).toBe(true);
+    expect(sedEntry?.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(sedEntry?.skipped).toBe("file-content-inspection-command");
+    expect(sedEntry?.tokenjuiceVersion).toBe(PACKAGE_VERSION);
+    expect(sedEntry?.savedChars).toBe(0);
+    expect(sedEntry?.ratio).toBe(1);
+    expect(sedEntry?.matchedReducer).toBeUndefined();
+    expect(gitEntry?.rewrote).toBe(false);
+    expect(gitEntry?.skipped).toBe("no-compaction");
+    expect(gitEntry?.savedChars).toBe(1);
   });
 
-  it("repairs malformed hook history lines before appending a new entry", async () => {
+  it("leaves legacy malformed history untouched and starts bounded segments", async () => {
     const home = await createTempDir();
     process.env.CODEX_HOME = home;
 
@@ -2021,17 +2417,39 @@ describe("runCodexPostToolUseHook", () => {
 
     await captureStdout(() => runCodexPostToolUseHook(payload));
 
-    const historyLines = (await readFile(join(home, "tokenjuice-hook.history.jsonl"), "utf8"))
-      .trim()
-      .split("\n");
-    const history = historyLines.map((line) => JSON.parse(line) as {
-      command?: string;
-      skipped?: string;
+    expect(await readFile(join(home, "tokenjuice-hook.history.jsonl"), "utf8"))
+      .toBe(`${validHistoryLine}\nnot-json\n{"truncated":true\n`);
+    const history = await readHookHistory(home);
+    expect(history).toHaveLength(1);
+    expect(history[0]?.commandFamily).toBe("sed");
+    expect(history[0]?.skipped).toBe("file-content-inspection-command");
+  });
+
+  it("redacts environment values and wrapper paths from hook history families", async () => {
+    const home = await createTempDir();
+    process.env.CODEX_HOME = home;
+    const secret = "TOP_SECRET_VALUE";
+    const privatePath = "/private/worktree";
+    const payload = JSON.stringify({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: {
+        command: `cd ${privatePath} && API_TOKEN=${secret} sed -n '1p' README.md`,
+      },
+      tool_response: "README",
     });
 
-    expect(history).toHaveLength(2);
-    expect(history[0]?.command).toBe("git status --short");
-    expect(history[1]?.command).toBe("sed -n '1,40p' src/hosts/codex/index.ts");
-    expect(history[1]?.skipped).toBe("file-content-inspection-command");
+    await runCodexPostToolUseHook(payload);
+
+    const history = await readHookHistory(home);
+    const historyDir = join(home, "tokenjuice-hook.history-v1");
+    const historyText = (
+      await Promise.all((await readdir(historyDir)).map((name) => readFile(join(historyDir, name), "utf8")))
+    ).join("\n");
+    expect(history).toHaveLength(1);
+    expect(history[0]?.commandFamily).toBe("sed");
+    expect(historyText).not.toContain(secret);
+    expect(historyText).not.toContain(privatePath);
+    expect(historyText).not.toContain("API_TOKEN");
   });
 });
